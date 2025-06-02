@@ -1,0 +1,281 @@
+---
+title: "Multi-Omics clustering of Breast cancer Subtypes"
+author: "Hizana Nasreen E S"
+date: "2025-01-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Introduction
+
+Breast cancer is a heterogeneous disease characterized by multiple molecular subtypes. These subtypes often differ in their genetic and epigenetic landscapes. To better understand this heterogeneity, we integrate RNA-seq gene expression and DNA methylation (Illumina 450k) data from The Cancer Genome Atlas (TCGA) Breast Invasive Carcinoma (BRCA) project. This study uses multi-omics integration and dimensionality reduction to explore the latent structure of patient subtypes.
+
+
+```{r}
+# Install required packages if not already installed
+if (!require("TCGAbiolinks")) BiocManager::install("TCGAbiolinks")
+if (!require("SummarizedExperiment")) BiocManager::install("SummarizedExperiment")
+if (!require("mixOmics")) BiocManager::install("mixOmics")
+if (!require("tidyverse")) install.packages("tidyverse")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(mixOmics)
+library(tidyverse)
+```
+##️ Data and Preprocessing
+
+- **Data Source**: TCGA-BRCA cohort accessed via the `TCGAbiolinks` R package.
+- **Sample Types**: Primary Tumor samples only.
+- **Omics Layers**:
+  - **Gene Expression**: RNA-seq (STAR - Counts workflow).
+  - **DNA Methylation**: Beta values from Illumina Human Methylation 450k arrays.
+- **Sample Matching**: Barcodes were truncated to 16 characters to ensure alignment across datasets.
+- **Feature Selection**:
+  - Top 100 most variable genes (by variance across samples).
+  - Top 100 most variable CpG sites (by variance across samples).
+- **Filtering**: Only samples common to both omics datasets were retained.
+
+####Work Flow
+
+- Specified project : Breast Invasive Carcinoma project
+- Data category : Retrieve RNA-seq data (Transcriptome Profiling)
+- Data type: Raw gene counts per sample (Gene Expression Quantification)
+- Workflow  type: STAR-aligned raw gene-level read counts (used for downstream normalization)
+- Sample type: Only tumor tissue samples, no normal adjacent tissues (Primary Tumor)
+
+```{r}
+query.exp <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type = "Primary Tumor"
+)
+
+
+GDCdownload(query.exp)
+exp.data <- GDCprepare(query.exp)
+```
+
+```{r}
+class(exp.data)
+
+assay(exp.data)[1:5, 1:5]  # first 5 genes × first 5 samples
+
+colData(exp.data)[,1:5]     # First 5 columns of sample metadata
+colnames(colData(exp.data))  # List of all available metadata columns
+
+rowData(exp.data)[1:5, ]   # Info about the first 5 genes
+
+```
+###RNA-seq (Gene Expression) Processing
+Gene expression data for breast cancer samples was obtained from the TCGA-BRCA project using the TCGAbiolinks package in R. Only Primary Tumor samples were selected, and the data was filtered for the “STAR - Counts” workflow to ensure raw gene-level read counts. The dataset was returned as a SummarizedExperiment object containing approximately 60,000 genes across 1,100 samples. Key clinical metadata (e.g., patient barcodes, tumor stage, vital status, PAM50 subtypes) was extracted using colData(). The top 100 most variable genes were selected based on variance across matched samples, forming the gene expression block for downstream analysis.
+
+
+
+```{r}
+query.meth <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",  
+  platform = "Illumina Human Methylation 450",
+  sample.type = "Primary Tumor"
+)
+
+
+GDCdownload(query.meth, method = "api", files.per.chunk = 10)
+
+meth.data <- GDCprepare(query.meth)
+```
+
+###DNA Methylation Processing
+DNA methylation data was similarly retrieved for the same cohort using the “Illumina Human Methylation 450” platform. To ensure a uniform data type, only “Methylation Beta Value” entries were queried via TCGAbiolinks. These beta values range from 0 (fully unmethylated) to 1 (fully methylated), and represent the methylation status at individual CpG sites. A total of ~900 primary tumor samples were included, and CpG site matrices were extracted using assay(). Sample barcodes were truncated and aligned with RNA-seq samples to ensure cross-modality consistency. The top 100 most variable CpG sites were selected and used as the methylation data block.
+
+
+```{r}
+assay(meth.data)[1:5, 1:5]
+colData(meth.data)[, 1:5]
+```
+
+```{r}
+rna.barcodes <- substr(colnames(assay(exp.data)), 1, 16)
+meth.barcodes <- substr(colnames(assay(meth.data)), 1, 16)
+common <- intersect(rna.barcodes, meth.barcodes)
+```
+
+```{r}
+#extract the expression matrices
+rna.mat <- assay(exp.data)
+meth.mat <- assay(meth.data)
+
+#Subset RNA and methylation data to the common samples
+# Matching by barcodes
+rna.filtered <- rna.mat[, substr(colnames(rna.mat), 1, 16) %in% common]
+meth.filtered <- meth.mat[, substr(colnames(meth.mat), 1, 16) %in% common]
+
+rna.sample.match <- match(common, substr(colnames(rna.filtered), 1, 16))
+meth.sample.match <- match(common, substr(colnames(meth.filtered), 1, 16))
+
+rna.filtered <- rna.filtered[, rna.sample.match]
+meth.filtered <- meth.filtered[, meth.sample.match]
+
+```
+
+
+```{r}
+all(substr(colnames(rna.filtered), 1, 16) == substr(colnames(meth.filtered), 1, 16))
+```
+
+####Selecting top variable features
+
+```{r}
+#selecting top 500 variable features
+# For RNA
+top.rna <- rna.filtered[order(apply(rna.filtered, 1, var), decreasing = TRUE)[1:500], ]
+
+# For Methylation
+top.meth <- meth.filtered[order(apply(meth.filtered, 1, var), decreasing = TRUE)[1:500], ]
+
+#transposing matrices
+rna.block <- t(top.rna)
+meth.block <- t(top.meth)
+
+#setting sample names
+rownames(rna.block) <- substr(rownames(rna.block), 1, 16)
+rownames(meth.block) <- substr(rownames(meth.block), 1, 16)
+
+#matching sample order
+common.samples <- intersect(rownames(rna.block), rownames(meth.block))
+rna.block <- rna.block[common.samples, ]
+meth.block <- meth.block[common.samples, ]
+
+#building the data.list for mixOmics
+data.list <- list(
+  RNA = rna.block,
+  Methylation = meth.block
+)
+```
+
+
+```{r}
+#Verification
+#checking data structures and dimensions
+str(data.list)
+
+dim(data.list$RNA)
+dim(data.list$Methylation)
+
+#checking if sample names match
+all(rownames(data.list$RNA) == rownames(data.list$Methylation))
+
+#Checking the first few values to make sure they look like real expression
+head(data.list$RNA[, 1:5])
+head(data.list$Methylation[, 1:5])
+
+#Confirming sample names are clean barcodes
+head(rownames(data.list$RNA))
+```
+
+##Extracting PAM50 subtypes
+
+```{r}
+colnames(colData(exp.data))
+```
+```{r}
+meta <- colData(exp.data)
+
+# Truncating RNA-seq barcodes to match those in data.list
+meta.barcodes <- substr(rownames(meta), 1, 16)
+sample.barcodes <- rownames(data.list$RNA)  
+
+# Extracting PAM50 subtype info
+pam50.raw <- data.frame(
+  Sample = meta.barcodes,
+  Subtype = meta$paper_BRCA_Subtype_PAM50  
+)
+
+# Filter to samples in data.list
+pam50.filtered <- pam50.raw[pam50.raw$Sample %in% sample.barcodes, ]
+
+# Drop NA subtypes
+pam50.filtered <- pam50.filtered[!is.na(pam50.filtered$Subtype), ]
+
+# Keep only matched samples
+matched.samples <- intersect(sample.barcodes, pam50.filtered$Sample)
+
+# Subset data.list accordingly
+data.list$RNA <- data.list$RNA[matched.samples, ]
+data.list$Methylation <- data.list$Methylation[matched.samples, ]
+
+# Create the response vector Y
+Y <- pam50.filtered$Subtype[match(matched.samples, pam50.filtered$Sample)]
+Y <- factor(Y)
+```
+
+```{r}
+table(Y)
+```
+
+##Model and visualization
+```{r}
+library(mixOmics)
+
+multi.splsda <- block.splsda(X = data.list, Y = Y, ncomp = 2)
+
+plotIndiv(multi.splsda, legend = TRUE, title = "Supervised Multi-Omics Clustering (PAM50)")
+```
+```{r}
+plotIndiv(multi.splsda, legend = TRUE, title = "PAM50 Clustering", ind.names = FALSE, ellipse = TRUE)
+
+```
+
+```{r}
+plotIndiv(
+  multi.splsda,
+  legend = TRUE,
+  title = "Supervised Clustering (PAM50)",
+  ind.names = FALSE,
+  ellipse = TRUE,
+  col.per.group = TRUE,
+  cex = 0.5,
+  legend.title = "Subtype",
+  legend.position = "right"
+)
+```
+
+```{r}
+perf.res <- perf(multi.splsda, validation = "Mfold", folds = 5, nrepeat = 10)
+```
+
+##Observations
+
+- Sample Integration: We successfully integrated RNA-seq gene expression and DNA methylation data from 787 breast cancer tumor samples from TCGA-BRCA using the mixOmics::block.splsda() method.
+
+- Subtype Labels: PAM50 subtypes were extracted and aligned with matched samples, enabling supervised learning across multiple omics layers.
+
+- Clustering Patterns:
+
+  -  The Basal and Luminal A (LumA) subtypes show relatively distinct clustering in the latent space of both RNA and methylation blocks.
+
+  - Luminal B (LumB) and Her2-enriched subtypes exhibit partial overlap, as commonly observed in breast cancer datasets due to shared molecular profiles.
+
+  - Normal-like samples form a small, less-defined cluster, reflecting their low representation and intermediate profiles.
+
+- Block Comparison:
+
+  - Both RNA and methylation blocks contribute meaningfully to subtype separation, though the RNA block showed slightly clearer separation, especially between LumA and Basal subtypes.
+
+##Conclusion
+
+This project demonstrates that multi-omics integration using supervised methods can effectively reveal biologically meaningful patterns in cancer subtypes. By combining gene expression and DNA methylation data, we were able to project high-dimensional data into a reduced space that aligns well with known PAM50 classifications. The pipeline built here is scalable to other cancer types and can be extended to include additional omics layers (e.g., copy number variation or proteomics).
+
+
+
+
+
+
+
